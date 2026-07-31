@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+agent.log
+src/memory/*.jsonl
+src/memory/*.json
