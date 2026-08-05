@@ -49,6 +49,7 @@ done
 
 # ===================== 路径推导 =====================
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#PROJECT_ROOT="~/wen/SPAW"
 SRC_DIR="${PROJECT_ROOT}/src"
 VENV_DIR="${PROJECT_ROOT}/.env"
 CORE_PY="${SRC_DIR}/core.py"

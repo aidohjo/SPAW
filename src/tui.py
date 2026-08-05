@@ -436,6 +436,8 @@ class AssistantTUI(App):
                 goal=goal,
                 max_iterations=2000,
                 exit_condition="auto",
+                short_term_memory= 20,
+                level_flag= "main",
                 on_event=self._on_agent_event
             )
             self.call_from_thread(self._on_agent_done, result)

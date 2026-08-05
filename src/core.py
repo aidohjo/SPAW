@@ -8,10 +8,12 @@ import time
 import logging
 import datetime
 import subprocess
+import threading
 from pathlib import Path
 from typing import Optional, Any
 from openai import OpenAI
 from web_search import WebSearchEngine
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============ 日志配置 ============
 log_dir = Path(__file__).parent          # 日志放在 src/ 目录下
@@ -86,6 +88,9 @@ class Daemon:
         #8. 加载搜索引擎
         self.se = WebSearchEngine()
 
+        #9. 记忆操作锁（可重入，线程安全）
+        self._memory_lock = threading.RLock()
+
     # ============ 记忆管理 ============
     
     def _load_long_term(self):
@@ -100,7 +105,13 @@ class Daemon:
         return {}
     
     def save_long_term(self):
-        """保存长期记忆到文件"""
+        """保存长期记忆到文件（线程安全）"""
+        with self._memory_lock:
+            with open(self.long_term_path, 'w', encoding='utf-8') as f:
+                json.dump(self.memory, f, ensure_ascii=False, indent=2)
+
+    def save_long_term_nolock(self):
+        """保存长期记忆到文件（调用者必须已持有 _memory_lock）"""
         with open(self.long_term_path, 'w', encoding='utf-8') as f:
             json.dump(self.memory, f, ensure_ascii=False, indent=2)
     
@@ -108,7 +119,8 @@ class Daemon:
         return self.memory.get(key, default)
     
     def set_memory(self, key, value):
-        self.memory[key] = value
+        with self._memory_lock:
+            self.memory[key] = value
             
     def append_to_short_term(self, role, content):
         """追加一条消息到今日短期记忆文件（JSONL）"""
@@ -123,7 +135,7 @@ class Daemon:
         with open(file_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     
-    def load_recent_short_term(self, limit=50):
+    def load_recent_short_term(self, limit: int =50):
         """加载今日最近的 N 条短期记忆"""
         today = datetime.datetime.now().strftime("%Y-%m-%d")
         file_path = self.short_term_dir / f"{today}.jsonl"
@@ -163,55 +175,53 @@ class Daemon:
             result = self.get_memory(key, None)
             if result is None:
                 return f"Key '{key}' not found."
-            # 将结果转为 JSON 字符串以便 LLM 阅读
             if isinstance(result, (list, dict)):
                 return json.dumps(result, ensure_ascii=False)
             return str(result)
 
-        elif action == "set":
-            if value is None:
-                return "Error: 'value' is required for action 'set'."
-            # 尝试将 value 解析为 JSON，以支持复杂类型（如数组、对象）
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError:
-                parsed = value  # 保持原始字符串
-            self.set_memory(key, parsed)
-            self.save_long_term()
-            return f"Successfully set '{key}' to {json.dumps(parsed, ensure_ascii=False)}"
+        # 所有写操作在同一个锁内完成，防止竞态条件
+        with self._memory_lock:
+            if action == "set":
+                if value is None:
+                    return "Error: 'value' is required for action 'set'."
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    parsed = value
+                self.memory[key] = parsed
+                self.save_long_term_nolock()
+                return f"Successfully set '{key}' to {json.dumps(parsed, ensure_ascii=False)}"
 
-        elif action == "append":
-            if value is None:
-                return "Error: 'value' is required for action 'append'."
-            current = self.get_memory(key)
-            if current is None:
-                current = []
-            elif not isinstance(current, list):
-                return f"Error: key '{key}' exists but is not a list (type: {type(current).__name__}). Cannot append."
-            current.append(value)
-            self.set_memory(key, current)
-            self.save_long_term()
-            return f"Successfully appended '{value}' to '{key}'. Now length: {len(current)}"
+            elif action == "append":
+                if value is None:
+                    return "Error: 'value' is required for action 'append'."
+                current = self.memory.get(key)
+                if current is None:
+                    current = []
+                elif not isinstance(current, list):
+                    return f"Error: key '{key}' exists but is not a list (type: {type(current).__name__}). Cannot append."
+                current.append(value)
+                self.memory[key] = current
+                self.save_long_term_nolock()
+                return f"Successfully appended '{value}' to '{key}'. Now length: {len(current)}"
 
-        elif action == "remove":
-            if index is None:
-                return "Error: 'index' is required for action 'remove'."
-            current = self.get_memory(key)
-            if current is None:
-                return f"Error: key '{key}' not found."
-            if not isinstance(current, list):
-                return f"Error: key '{key}' is not a list (type: {type(current).__name__}). Cannot remove by index."
-            if not (0 <= index < len(current)):
-                return f"Error: index {index} out of range. Valid indices: 0..{len(current)-1}"
-            removed = current.pop(index)
-            self.set_memory(key, current)
-            self.save_long_term()
-            return f"Successfully removed item at index {index} (value: '{removed}') from '{key}'. Remaining length: {len(current)}"
+            elif action == "remove":
+                if index is None:
+                    return "Error: 'index' is required for action 'remove'."
+                current = self.memory.get(key)
+                if current is None:
+                    return f"Error: key '{key}' not found."
+                if not isinstance(current, list):
+                    return f"Error: key '{key}' is not a list (type: {type(current).__name__}). Cannot remove by index."
+                if not (0 <= index < len(current)):
+                    return f"Error: index {index} out of range. Valid indices: 0..{len(current)-1}"
+                removed = current.pop(index)
+                self.memory[key] = current
+                self.save_long_term_nolock()
+                return f"Successfully removed item at index {index} (value: '{removed}') from '{key}'. Remaining length: {len(current)}"
 
-        else:
-            return f"Error: unknown action '{action}'. Supported: get, set, append, remove."
-
-
+            else:
+                return f"Error: unknown action '{action}'. Supported: get, set, append, remove."
 
     # ============ 工具执行 ============
     
@@ -228,7 +238,9 @@ class Daemon:
             "execute_command": self._tool_execute_command,
             "manage_long_term_memory":self._manage_long_term_memory,
             "auto_agent":self._run_agent,
-            "search":self._search
+            "search":self._search,
+            "deep_search":self.se.search_with_context,
+            "search_with_url":self.se.fetch_full_content
 
         }
         if tool_name in tools_map:
@@ -261,7 +273,7 @@ class Daemon:
         except Exception as e:
             return f"error:{str(e)}"
 
-    def _search(self, key_word:str, limit:int = 3):
+    def _search(self, key_word:str, limit:int = 8):
         return self.se.search_text(query = key_word, max_results = limit)
 
         
@@ -375,7 +387,7 @@ class Daemon:
             "3. **检查结果**：分析工具返回的结果，判断子任务是否完成。\n"
             "4. **迭代推进**：若未完成则继续调用工具；若完成则进入下一子任务。\n"
             "5. **最终完成**：当所有子任务完成时，务必调用 finish_task 工具，并在 summary 中给出完整总结。\n"
-            "注意：每次只调用一个工具（除非必要），避免无效循环。若尝试3次仍失败，请说明原因并调用 finish_task 给出当前进展。\n"
+            "注意：每次可以调用多个工具，避免无效循环。若尝试3次仍失败，请说明原因并调用 finish_task 给出当前进展。\n"
         )
         return base_prompt + extra
 
@@ -383,6 +395,8 @@ class Daemon:
 
     def _run_agent(self, goal: str, max_iterations: int = 150, 
                    exit_condition: str = "auto", context: str = "",
+                   level_flag: str = "main",
+                   short_term_memory: int = 20,
                    on_event: callable = None) -> str:
         """
         自循环执行任务，自动迭代调用工具，直至满足退出条件。
@@ -391,24 +405,28 @@ class Daemon:
             goal: 用户任务描述（目标）
             max_iterations: 最大循环轮次（硬性约束）
             exit_condition: 退出策略 'auto' | 'max_only' | 'complete_only'
+            level_flag: 标识当前agent的关系： 'main'| 'son {father_name}'
             context: 可选额外上下文（字符串），会作为系统提示附加信息
 
         Returns:
             最终的总结字符串
         """
-        # 记录用户输入到短期记忆
-        self.append_to_short_term("user", goal)
+        # 记录用户输入到短期记忆（子 agent 加前缀以避免污染父 agent 上下文）
+        tag = f"[{level_flag}] " if level_flag != "main" else ""
+        self.append_to_short_term("user", tag + goal)
 
         # 构建初始消息列表
         system_content = self.build_system_prompt()
         if context:
             system_content += f"\n\n额外上下文信息：\n{context}"
-        memory_context = f"当前长期记忆内容：\n{json.dumps(self.memory, ensure_ascii=False, indent=2)}"
+        def _build_memory_context():
+            return f"当前长期记忆内容：\n{json.dumps(self.memory, ensure_ascii=False, indent=2)}"
+
         messages = [
             {"role": "system", "content": system_content},
-            {"role": "system", "content": memory_context}
+            {"role": "system", "content": _build_memory_context()}
         ]
-        history = self.load_recent_short_term(limit=8)
+        history = self.load_recent_short_term(limit=short_term_memory)
         messages.extend(history)
         messages.append({"role": "user", "content": goal})
 
@@ -417,6 +435,9 @@ class Daemon:
 
         while iteration < max_iterations:
             iteration += 1
+            # 每轮迭代开始时刷新长期记忆上下文（反映上轮可能的修改）
+            if iteration > 1:
+                messages[1]["content"] = _build_memory_context()
             logger.info(f"----- Agent 迭代 {iteration}/{max_iterations} -----")
             if on_event:
                 on_event({"type": "iteration_start", "iteration": iteration, "max_iterations": max_iterations})
@@ -459,49 +480,120 @@ class Daemon:
             if full_content and on_event:
                 on_event({"type": "assistant_text", "content": full_content, "iteration": iteration})
 
-            # 无工具调用 -> 模型自判完成（所有策略下均退出，因为不会再产生新动作）
+            # 无工具调用 -> 模型自判完成
             if not message.tool_calls:
+                if exit_condition == "max_only":
+                    # max_only 模式：忽略模型自判，继续迭代
+                    logger.info("模型无工具调用，但 max_only 模式继续迭代")
+                    continue
                 final_reply = message.content or "任务已完成（无工具调用）"
                 if on_event:
                     on_event({"type": "done", "summary": final_reply, "iteration": iteration})
                 break
 
+
             # 处理工具调用
             tool_calls = message.tool_calls
             finished = False
-            for tool_call in tool_calls:
-                tool_name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments)
-                if tool_name == "finish_task":
-                    summary = args.get("summary", "任务已完成，但未提供总结。")
+
+            # ========== 第一步：检查是否有 finish_task ==========
+            finish_call = None
+            other_calls = []
+            for tc in tool_calls:
+                if tc.function.name == "finish_task":
+                    finish_call = tc  # 取最后一个 finish_task（不应有多个）
+                else:
+                    other_calls.append(tc)
+
+            # ========== 第二步：如果存在 finish_task，处理它 ==========
+            if finish_call:
+                args = json.loads(finish_call.function.arguments)
+                summary = args.get("summary", "任务已完成，但未提供总结。")
+                if exit_condition == "max_only":
+                    # max_only 模式：记录 finish_task 但不退出
+                    logger.info(f"Agent 主动完成（max_only 模式忽略），总结：{summary}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": finish_call.id,
+                        "content": f"finish_task acknowledged (max_only mode, continuing). Summary: {summary}"
+                    })
+                    if on_event:
+                        on_event({"type": "tool_result", "tool_name": "finish_task",
+                                  "result": f"(max_only, continuing) {summary}", "iteration": iteration})
+                    # 不 break，继续处理 other_calls
+                else:
                     final_reply = summary
                     logger.info(f"Agent 主动完成，总结：{summary}")
                     if on_event:
                         on_event({"type": "done", "summary": summary, "iteration": iteration})
                     finished = True
-                    break
-                else:
-                    # 执行普通工具
+                    break  # 跳出 while 循环
+
+            # ========== 第三步：没有 finish_task，并行执行所有普通工具 ==========
+            if not other_calls:
+                # 没有普通工具，继续下一轮（可能模型没有调用工具，直接回复）
+                continue
+
+            # 先发出所有工具调用事件（让前端/日志知道开始执行）
+            if on_event:
+                for tc in other_calls:
+                    args = json.loads(tc.function.arguments)
+                    on_event({
+                        "type": "tool_call",
+                        "tool_name": tc.function.name,
+                        "args": args,
+                        "iteration": iteration
+                    })
+
+            # 使用线程池并行执行工具
+            with ThreadPoolExecutor(max_workers=min(len(other_calls), 8)) as executor:
+                # 提交所有任务，保留 future 与 tool_call 的映射
+                future_to_call = {
+                    executor.submit(self._execute_tool, tc.function.name, json.loads(tc.function.arguments)): tc
+                    for tc in other_calls
+                }
+                
+                # 等待所有任务完成，并按原始顺序收集结果
+                # 这里有两种策略：
+                # 1. 使用 as_completed 按完成顺序处理（更快输出结果事件）
+                # 2. 保持原始顺序，方便后续按序添加消息
+                # 我们选择 as_completed 以获得更快的反馈，但结果消息的顺序不影响大模型理解（因为 tool_call_id 是唯一标识）
+                results = {}  # tool_call_id -> result
+                for future in as_completed(future_to_call):
+                    tc = future_to_call[future]
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        # 确保工具异常不会导致整个 Agent 崩溃
+                        result = f"工具执行出错: {str(e)}"
+                        logger.error(f"工具 {tc.function.name} 执行异常: {e}")
+                    
+                    results[tc.id] = result
+                    # 发出单个工具结果事件（可选的，顺序可能乱，但状态是真实的）
                     if on_event:
-                        on_event({"type": "tool_call", "tool_name": tool_name, "args": args, "iteration": iteration})
-                    result = self._execute_tool(tool_name, args)
-                    if on_event:
-                        on_event({"type": "tool_result", "tool_name": tool_name, "result": str(result)[:500], "iteration": iteration})
+                        on_event({
+                            "type": "tool_result",
+                            "tool_name": tc.function.name,
+                            "result": str(result)[:500],
+                            "iteration": iteration
+                        })
+                
+                # 按原始顺序将工具结果追加到 messages 中（保证对话历史的顺序一致性）
+                for tc in other_calls:
                     messages.append({
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result
+                        "tool_call_id": tc.id,
+                        "content": results.get(tc.id, "未获取到结果")
                     })
-                
-            if finished:
-                break
-            # 若没有 finish_task，继续下一轮循环
-            continue
+
+            # 没有 finish_task，继续下一轮循环
+            continue        
+        # while 正常结束（达到 max_iterations）
         else:
-            # while 正常结束（达到 max_iterations）
-            logger.warning(f"达到最大迭代次数 {max_iterations}，强制终止。")
-            if exit_condition == "complete_only":
-                final_reply = f"错误：任务未能在 {max_iterations} 次迭代内完成。"
+            if iteration >= max_iterations:
+                logger.warning(f"达到最大迭代次数 {max_iterations}，强制终止。")
+                if exit_condition == "complete_only":
+                    final_reply = f"错误：任务未能在 {max_iterations} 次迭代内完成。"
             else:
                 # auto 或 max_only 模式下，返回最后一条助手消息（若有）
                 if messages and messages[-1].get("role") == "assistant":
@@ -509,7 +601,8 @@ class Daemon:
                     if last_content:
                         final_reply = last_content
 
-        self.append_to_short_term("assistant", final_reply)
+        tag = f"[{level_flag}] " if level_flag != "main" else ""
+        self.append_to_short_term("assistant", tag + final_reply)
         return final_reply
  
 
