@@ -182,7 +182,7 @@ class WebSearchEngine:
             
             if response.status_code != 200:
                 logger.warning("抓取失败，状态码 %d: %s", response.status_code, url)
-                return None
+                return ""
 
             # 2. 使用 trafilatura 提取正文
             # extract 返回纯文本，include_comments=False 排除杂乱评论
@@ -198,7 +198,7 @@ class WebSearchEngine:
                 # 如果 trafilatura 提取为空，尝试降级方案：直接取前 2000 字符
                 # 但通常 trafilatura 效果很好
                 logger.warning("trafilatura 未能提取正文: %s", url)
-                return None
+                return ""
                 
             # 简单清洗：去除过度的换行
             cleaned = '\n'.join([line.strip() for line in extracted_text.splitlines() if line.strip()])
@@ -206,10 +206,10 @@ class WebSearchEngine:
             
         except requests.exceptions.Timeout:
             logger.error("抓取超时: %s", url)
-            return None
+            return ""
         except Exception as e:
             logger.error("抓取 '%s' 异常: %s", url, e)
-            return None
+            return ""
 
     def deep_search(
         self, 
