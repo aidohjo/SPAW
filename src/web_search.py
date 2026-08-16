@@ -2,27 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-web_search.py — 网络搜索引擎接口
+web_search.py — 网络搜索引擎接口（基于 duckduckgo-search 库）
 与 core.py 配合使用，为 AI Daemon 提供网络搜索能力。
-基于 DuckDuckGo Lite（无 JS、轻量 HTML），使用 requests 获取搜索结果，
-正则表达式清理标签并提取纯文本摘要。
-
-可独立使用，也可作为 Daemon 的工具函数导入。
+使用 duckduckgo-search 库替代原 HTML 解析方案，稳定性更高。
 """
 
-import re
 import logging
-import time
-from typing import List, Optional
-from urllib.parse import quote_plus
-
+import trafilatura
 import requests
+from typing import List, Optional, Dict
+import logging
+from urllib.parse import urlparse
+
+from ddgs import DDGS
 
 # ============ 日志配置 ============
 logger = logging.getLogger(__name__)
 
-
-# ============ 数据结构 ============
+# ============ 数据结构（保持不变） ============
 
 class WebSearchResult:
     """单条网络搜索结果"""
@@ -58,159 +55,83 @@ class WebSearchResult:
         return f"WebSearchResult(title={self.title!r}, url={self.url!r})"
 
 
-# ============ 标签清理工具 ============
-
-# 预编译正则，避免每次调用重新编译
-_RE_SCRIPT_STYLE = re.compile(
-    r'<(script|style|noscript|iframe|svg|canvas|video|audio|'
-    r'source|embed|object|applet|form|select|option|textarea|'
-    r'input|button|label|fieldset|legend|datalist|output|'
-    r'map|area|nav|footer|header|aside|template|slot|'
-    r'head|meta|link|title|base)[^>]*?>.*?</\1\s*>',
-    re.DOTALL | re.IGNORECASE,
-)
-
-_RE_SELF_CLOSING_TAGS = re.compile(
-    r'<(?:br|hr|img|input|meta|link|base|area|col|embed|'
-    r'source|track|wbr|param)\s*[^>]*?>',
-    re.IGNORECASE,
-)
-
-_RE_ALL_TAGS = re.compile(r'<[^>]*?>')
-
-_RE_WHITESPACE = re.compile(r'[ \t]+')
-_RE_BLANK_LINES = re.compile(r'\n{3,}')
-_RE_ENTITIES = re.compile(r'&(?:amp|lt|gt|quot|nbsp|#\d+|#x[0-9a-fA-F]+);')
-
-
-def clean_html(raw_html: str) -> str:
-    """清理 HTML 标签，返回纯文本。
-
-    处理顺序：
-    1. 移除 <script>/<style> 等整块标签（含内容）
-    2. 移除自闭合标签（<br>, <img> 等）
-    3. 移除所有剩余 HTML 标签
-    4. 解码常见 HTML 实体
-    5. 压缩多余空白
-    """
-    if not raw_html:
-        return ""
-
-    text = raw_html
-
-    # 1. 移除整块标签（script, style, noscript 等）
-    text = _RE_SCRIPT_STYLE.sub(" ", text)
-
-    # 2. 自闭合标签替换为空格（避免单词粘连）
-    text = _RE_SELF_CLOSING_TAGS.sub(" ", text)
-
-    # 3. 移除所有剩余标签
-    text = _RE_ALL_TAGS.sub(" ", text)
-
-    # 4. 解码 HTML 实体
-    text = text.replace("&amp;", "&")
-    text = text.replace("&lt;", "<")
-    text = text.replace("&gt;", ">")
-    text = text.replace("&quot;", '"')
-    text = text.replace("&nbsp;", " ")
-    text = text.replace("&#x27;", "'")
-
-    # 5. 压缩空白
-    text = _RE_WHITESPACE.sub(" ", text)
-    text = _RE_BLANK_LINES.sub("\n\n", text)
-
-    return text.strip()
-
-
-# ============ 搜索引擎类 ============
+# ============ 搜索引擎类（重构版） ============
 
 class WebSearchEngine:
-    """基于 DuckDuckGo Lite 的网络搜索引擎。
+    """
+    基于 duckduckgo-search 库的网络搜索引擎。
 
-    用法::
-
-        wse = WebSearchEngine()
+    用法与之前完全一致：
+        wse = WebSearchEngine(proxies={"http": "http://127.0.0.1:7890", ...})
         results = wse.search("Python 教程")
-        for r in results:
-            print(r)
-        # 或直接获取文本摘要
         print(wse.search_text("Python 教程"))
-
-    特性:
-    - 无 JS 依赖，纯 HTTP + HTML 解析
-    - 自动清理所有 HTML 标签
-    - 提取标题、摘要、URL
-    - 可配置超时、重试、结果数量
     """
 
-    _BASE_URL = "https://lite.duckduckgo.com/lite/"
-    _DEFAULT_TIMEOUT = 12
-    _DEFAULT_MAX_RETRIES = 2
-    _DEFAULT_RESULTS = 10
+    _DEFAULT_TIMEOUT = 30          # duckduckgo-search 默认超时
+    _DEFAULT_MAX_RESULTS = 10
 
     def __init__(
         self,
         *,
         timeout: int = _DEFAULT_TIMEOUT,
-        max_retries: int = _DEFAULT_MAX_RETRIES,
-        max_results: int = _DEFAULT_RESULTS,
-        user_agent: Optional[str] = None,
+        max_results: int = _DEFAULT_MAX_RESULTS,
+ 
     ):
         """
         Args:
-            timeout: HTTP 请求超时秒数
-            max_retries: 请求失败重试次数
+            timeout: HTTP 请求超时秒数（传递给 DDGS）
             max_results: 单次搜索返回的最大结果数
-            user_agent: 自定义 User-Agent，默认使用常见浏览器标识
+            proxies: 代理配置，格式如 {"http": "http://127.0.0.1:7890", "https": "..."}
         """
         self._timeout = timeout
-        self._max_retries = max_retries
         self._max_results = max_results
-        self._user_agent = user_agent or (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    
+        self._ddgs = DDGS(
+            timeout=self._timeout,
         )
-        self._session = requests.Session()
-        self._session.headers.update({"User-Agent": self._user_agent})
-
-        logger.info("WebSearchEngine 初始化 — timeout=%ds, retries=%d, max_results=%d",
-                     timeout, max_retries, max_results)
+        import os
+        logger.info(
+            "WebSearchEngine 初始化 — timeout=%ds, max_results=%d, proxies=%s",
+            timeout, max_results, os.environ["http_proxy"] or None
+        )
 
     # ========== 公开 API ==========
 
     def search(self, query: str, max_results: Optional[int] = None) -> List[WebSearchResult]:
-        """执行网络搜索，返回结构化结果列表。
-
-        Args:
-            query: 搜索关键词
-            max_results: 覆盖默认最大结果数
-
-        Returns:
-            WebSearchResult 列表（可能为空）
-        """
+        """执行网络搜索，返回结构化结果列表。"""
         limit = max_results if max_results is not None else self._max_results
-        html = self._fetch(query)
 
-        if not html:
-            logger.warning("搜索 '%s' 未获取到页面内容", query)
+        try:
+            # duckduckgo_search 的 text() 方法返回生成器，我们转为列表
+            raw_results = list(self._ddgs.text(query, max_results=limit))
+        except Exception as e:
+            logger.error("搜索 '%s' 失败: %s", query, e)
             return []
 
-        results = self._parse_results(html, limit)
+        results: List[WebSearchResult] = []
+        for item in raw_results:
+            # 字段映射：title, href, body
+            title = item.get("title", "")
+            url = item.get("href", "")
+            snippet = item.get("body", "")
+            # display_url 可由 url 精简，也可留空
+            display_url = url  # 或自行处理
+
+            if not title:  # 跳过空标题
+                continue
+
+            results.append(WebSearchResult(
+                title=title,
+                url=url,
+                snippet=snippet,
+                display_url=display_url,
+            ))
+
         logger.info("搜索 '%s' → %d 条结果", query, len(results))
         return results
 
     def search_text(self, query: str, max_results: Optional[int] = None) -> str:
-        """执行搜索，返回人类可读的纯文本摘要。
-
-        适合直接作为工具调用的返回值。
-
-        Args:
-            query: 搜索关键词
-            max_results: 覆盖默认最大结果数
-
-        Returns:
-            格式化的纯文本搜索结果，或提示信息
-        """
+        """执行搜索，返回人类可读的纯文本摘要。"""
         results = self.search(query, max_results)
 
         if not results:
@@ -228,7 +149,7 @@ class WebSearchEngine:
         return "\n".join(lines).strip()
 
     def search_json(self, query: str, max_results: Optional[int] = None) -> str:
-        """执行搜索，返回 JSON 格式结果（方便程序处理）。"""
+        """执行搜索，返回 JSON 格式结果。"""
         import json
         results = self.search(query, max_results)
         data = {
@@ -238,188 +159,137 @@ class WebSearchEngine:
         }
         return json.dumps(data, ensure_ascii=False, indent=2)
 
-    # ========== 内部方法 ==========
-
-    def _fetch(self, query: str) -> Optional[str]:
-        """发起 HTTP 请求，获取搜索结果 HTML。"""
-        params = {"q": query}
-
-        for attempt in range(1, self._max_retries + 2):
-            try:
-                resp = self._session.get(
-                    self._BASE_URL,
-                    params=params,
-                    timeout=self._timeout,
-                )
-                resp.raise_for_status()
-
-                # DuckDuckGo 有时会返回重定向或验证页面
-                content_type = resp.headers.get("Content-Type", "")
-                if "text/html" not in content_type:
-                    logger.debug("非 HTML 响应: Content-Type=%s", content_type)
-
-                return resp.text
-
-            except requests.Timeout:
-                logger.warning("请求超时 (尝试 %d/%d): %s", attempt,
-                               self._max_retries + 1, query)
-            except requests.HTTPError as e:
-                logger.warning("HTTP 错误 (尝试 %d/%d): %s", attempt,
-                               self._max_retries + 1, e)
-            except requests.RequestException as e:
-                logger.warning("请求异常 (尝试 %d/%d): %s", attempt,
-                               self._max_retries + 1, e)
-
-            if attempt <= self._max_retries:
-                time.sleep(1.0 * attempt)  # 递增退避
-
-        logger.error("搜索 '%s' 失败，已重试 %d 次", query, self._max_retries + 1)
-        return None
-
-    def _parse_results(self, html: str, limit: int) -> List[WebSearchResult]:
-        """从 DuckDuckGo Lite HTML 中解析搜索结果。
-
-        DDG Lite 的结果结构（简化）::
-
-            <tr>
-              <td>1.&nbsp;</td>
-              <td><a class='result-link' href="...">标题</a></td>
-            </tr>
-            <tr>
-              <td>&nbsp;&nbsp;&nbsp;</td>
-              <td class='result-snippet'>摘要...</td>
-            </tr>
-            <tr>
-              <td>&nbsp;&nbsp;&nbsp;</td>
-              <td><span class='link-text'>显示URL</span></td>
-            </tr>
+    def fetch_full_content(self, url: str, timeout: int = 10) -> Optional[str]:
         """
-        results: List[WebSearchResult] = []
-
-        # 匹配每个结果块：result-link → result-snippet → link-text
-        # 使用更健壮的方式：先找到所有 result-link
-        # 两步匹配：先找 class=result-link 的 <a> 标签，再从中提取 href 和文本
-        # （因为 href 和 class 在标签中的顺序不固定）
-        _tag_pattern = re.compile(
-            r'<a\s+[^>]*class\s*=\s*[\'"]result-link[\'"][^>]*>.*?</a>',
-            re.DOTALL | re.IGNORECASE,
-        )
-        _href_pattern = re.compile(
-            r'href\s*=\s*[\'"]([^\'"]*?)[\'"]',
-            re.IGNORECASE,
-        )
-        _title_pattern = re.compile(
-            r'<a[^>]*>(.*?)</a>',
-            re.DOTALL | re.IGNORECASE,
-        )
-
-        snippet_pattern = re.compile(
-            r'<td\s+[^>]*?class\s*=\s*[\'"]result-snippet[\'"][^>]*?>'
-            r'(.*?)</td>',
-            re.DOTALL | re.IGNORECASE,
-        )
-
-        link_text_pattern = re.compile(
-            r'<span\s+[^>]*?class\s*=\s*[\'"]link-text[\'"][^>]*?>'
-            r'(.*?)</span>',
-            re.DOTALL | re.IGNORECASE,
-        )
-
-        # 两步提取
-        raw_tags = _tag_pattern.findall(html)
-        links = []
-        for tag in raw_tags:
-            href_m = _href_pattern.search(tag)
-            title_m = _title_pattern.search(tag)
-            if href_m and title_m:
-                links.append((href_m.group(1), title_m.group(1).strip()))
-        snippets = snippet_pattern.findall(html)
-        link_texts = link_text_pattern.findall(html)
-
-        for i, (raw_url, raw_title) in enumerate(links):
-            if len(results) >= limit:
-                break
-
-            url = self._clean_url(raw_url)
-            title = clean_html(raw_title).strip()
-
-            snippet = ""
-            if i < len(snippets):
-                snippet = clean_html(snippets[i]).strip()
-
-            display_url = ""
-            if i < len(link_texts):
-                display_url = clean_html(link_texts[i]).strip()
-
-            # 跳过空标题
-            if not title:
-                continue
-
-            results.append(WebSearchResult(
-                title=title,
-                url=url,
-                snippet=snippet,
-                display_url=display_url,
-            ))
-
-        return results
-
-    @staticmethod
-    def _clean_url(raw_url: str) -> str:
-        """清理 DuckDuckGo 的跳转 URL，提取真实目标 URL。
-
-        DDG Lite 的 href 形如::
-
-            //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=...
-
-        需要提取 uddg 参数并 URL 解码。
+        抓取指定 URL 的网页并提取正文全文。
+        
+        Args:
+            url: 目标网址
+            timeout: 请求超时时间
+            
+        Returns:
+            提取的纯文本内容，如果失败或解析不到则返回 None
         """
-        from urllib.parse import unquote
+        try:
+            # 1. 发送请求（建议复用 self._ddgs 的代理配置）
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            # 如果你之前传入了 proxies，这里可以获取并传入
+            # 简单起见，这里直接用 requests.get
+            response = requests.get(url, timeout=timeout, headers=headers)
+            response.encoding = response.apparent_encoding or 'utf-8'
+            
+            if response.status_code != 200:
+                logger.warning("抓取失败，状态码 %d: %s", response.status_code, url)
+                return None
 
-        # 补齐协议
-        if raw_url.startswith("//"):
-            raw_url = "https:" + raw_url
+            # 2. 使用 trafilatura 提取正文
+            # extract 返回纯文本，include_comments=False 排除杂乱评论
+            extracted_text = trafilatura.extract(
+                response.text,
+                include_comments=False,
+                include_links=False,
+                include_tables=True,   # 技术博客经常有表格
+                include_formatting=True
+            )
+            
+            if not extracted_text:
+                # 如果 trafilatura 提取为空，尝试降级方案：直接取前 2000 字符
+                # 但通常 trafilatura 效果很好
+                logger.warning("trafilatura 未能提取正文: %s", url)
+                return None
+                
+            # 简单清洗：去除过度的换行
+            cleaned = '\n'.join([line.strip() for line in extracted_text.splitlines() if line.strip()])
+            return cleaned
+            
+        except requests.exceptions.Timeout:
+            logger.error("抓取超时: %s", url)
+            return None
+        except Exception as e:
+            logger.error("抓取 '%s' 异常: %s", url, e)
+            return None
 
-        # 尝试提取 uddg 参数
-        match = re.search(r'uddg=([^&]+)', raw_url)
-        if match:
-            return unquote(match.group(1))
+    def deep_search(
+        self, 
+        query: str, 
+        max_results: int = 5, 
+        fetch_all: bool = True
+    ) -> List[Dict]:
+        """
+        增强搜索：不仅返回标题/摘要，还抓取并附上前 N 个结果的全文内容。
+        
+        Args:
+            query: 搜索关键词
+            max_results: 最多处理几个链接（建议 3~5 个，抓取全文耗时较长）
+            fetch_all: 是否全部抓取，否则只抓取第一个
+            
+        Returns:
+            包含 'title', 'url', 'snippet', 'full_content' 的字典列表
+        """
+        results = self.search(query, max_results=max_results)
+        if not results:
+            return []
 
-        # 如果没找到 uddg，返回原始 URL（去掉协议缺失）
-        return raw_url
+        deep_results = []
+        # 只处理前 max_results 个，避免耗时过长
+        for r in results[:max_results]:
+            item = {
+                "title": r.title,
+                "url": r.url,
+                "snippet": r.snippet,
+                "full_content": None
+            }
+            if fetch_all:
+                logger.info("正在抓取全文: %s", r.url)
+                content = self.fetch_full_content(r.url)
+                # 截断过长内容，防止 LLM Token 溢出（比如限制 8000 字符）
+                if content and len(content) > 8000:
+                    content = content[:8000] + "...(已截断)"
+                item["full_content"] = content
+            
+            deep_results.append(item)
+        
+        logger.info("深搜完成，共处理 %d 个页面", len(deep_results))
+        return deep_results
+
+    def search_with_context(self, query: str, max_results: int = 3) -> str:
+        """
+        生成适合 LLM 调用的上下文文本：摘要 + 全文。
+        """
+        items = self.deep_search(query, max_results=max_results, fetch_all=True)
+        if not items:
+            return f"未找到与 '{query}' 相关的结果。"
+        
+        output_lines = [f"🔍 搜索: {query}\n"]
+        for idx, item in enumerate(items, 1):
+            output_lines.append(f"--- 结果 {idx} ---")
+            output_lines.append(f"标题: {item['title']}")
+            output_lines.append(f"链接: {item['url']}")
+            if item['snippet']:
+                output_lines.append(f"摘要: {item['snippet']}")
+            if item['full_content']:
+                output_lines.append(f"全文内容 (截取):\n{item['full_content']}")
+            else:
+                output_lines.append("(未能抓取到全文)")
+            output_lines.append("")
+        
+        return "\n".join(output_lines)
 
 
-# ============ 工具函数（可直接在 Daemon 中注册为 tool） ============
-
+# ============ 工具函数 ============
 
 def tool_web_search(query: str, max_results: int = 10) -> str:
-    """供 Daemon 直接调用的网络搜索工具函数。
-
-    返回人类可读的纯文本搜索结果。
-    """
+    """供 Daemon 直接调用的网络搜索工具函数。"""
     wse = WebSearchEngine(max_results=max_results)
     return wse.search_text(query, max_results=max_results)
 
 
-# ============ 入口测试 ============
-
+# ============ 简易测试（可选） ============
 if __name__ == "__main__":
-    import sys
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
+    # 设置代理（如果需要）
 
     engine = WebSearchEngine(max_results=5)
-
-    if len(sys.argv) < 2:
-        # 默认测试搜索
-        test_query = "Python asyncio tutorial"
-        print(f"🔍 测试搜索: {test_query}")
-        print(engine.search_text(test_query))
-        print("\n--- JSON 格式 ---")
-        print(engine.search_json(test_query))
-    else:
-        query = " ".join(sys.argv[1:])
-        print(engine.search_text(query))
+    Q = input("Q: ")
+    print(engine.fetch_full_content(Q))

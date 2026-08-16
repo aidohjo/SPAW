@@ -124,7 +124,17 @@
               "type": "string",
               "description": "可选的上文信息或初始上下文，帮助工具理解任务背景。",
               "default": ""
-            }
+            },
+	    "level_flag":{
+	    "type": "string",
+	    "description":  "标识当前agent的等级关系： 'main' | 'son {father_name}'",
+	    "default": "main"
+		},
+	    "short_term_memory":{
+   		"type": "integer",
+		"description": "当前要创建的agent的记忆上下文的回溯对话的条数，对于简单子agent应该调用context传递信息。",
+		"default": ""
+			}
           },
           "required": [
             "goal"
@@ -146,14 +156,66 @@
             },
             "limit": {
               "type": "integer",
-              "description": "返回的最大结果数量，默认为 7",
-              "default": 7,
+              "description": "返回的最大结果数量，默认为 8",
+              "default": 8,
               "minimum": 1,
               "maximum": 20
             }
           },
           "required": [
             "key_word"
+          ]
+        }
+      }
+    },
+     {
+      "type": "function",
+      "function": {
+        "name": "deep_search",
+        "description": "执行网络搜索，返回相关网页的标题、摘要和链接。适用于深度获取大量实时信息或外部知识的细节。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "搜索关键词，例如 '加缪死亡的真相'"
+            },
+            "max_results": {
+              "type": "integer",
+              "description": "返回的最大结果数量，默认为 8",
+              "default": 8,
+              "minimum": 1,
+              "maximum": 20
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_with_url",
+        "description": "执行网络搜索，返回要求网页的标题、内容和链接。适用于深度获取此网页的实时信息或外部知识的细节。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "搜索的网页"
+            },
+            "timeout": {
+              "type": "integer",
+              "description": "搜索限制时间",
+              "default": 10,
+              "minimum": 10,
+              "maximum": 200
+            }
+          },
+          "required": [
+            "url"
           ]
         }
       }
